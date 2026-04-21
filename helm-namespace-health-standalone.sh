@@ -257,7 +257,11 @@ check_namespace() {
 
   # ── Pretty output header ─────────────────────────────────────────────
   if [[ "$OUTPUT_FORMAT" == "pretty" ]]; then
-    log_header "Namespace: ${ns}  (context: ${CONTEXT})"
+    if [[ -n "$FILTER_NS" ]]; then
+      log_header "Namespace: ${ns}  (selected via -n)  (context: ${CONTEXT})"
+    else
+      log_header "Namespace: ${ns}  (context: ${CONTEXT})"
+    fi
   fi
 
   for release in "${RELEASES[@]}"; do
@@ -984,6 +988,11 @@ main() {
     echo "  ║       Helm Namespace Health Check                ║"
     echo "  ║       Context    : ${CONTEXT}"
     echo "  ║       Kubeconfig : ${KUBECONFIG_DISPLAY}"
+    if [[ -n "$FILTER_NS" ]]; then
+      echo "  ║       Namespace  : ${FILTER_NS} (filtered) ║"
+    else
+      echo "  ║       Namespace  : All ║"
+    fi
     echo "  ╚══════════════════════════════════════════════════╝"
     echo -e "${RESET}"
   fi
