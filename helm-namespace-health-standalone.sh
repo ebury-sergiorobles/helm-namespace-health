@@ -8,6 +8,7 @@
 #
 # For every namespace that has at least one active Helm release, checks:
 #   - Helm release status
+#   - Helm history analysis (rollback detection, failed upgrades)
 #   - Deployment availability (desired vs ready replicas)
 #   - StatefulSet availability (desired vs ready replicas, revision match)
 #   - Pod health (phase, ready, restart count)
@@ -22,7 +23,7 @@
 
 set -euo pipefail
 
-# ── Defaults ──────────────────────────────────────────────────────────────────
+# ── Defaults ────────────────────────────────────────────────────────────
 CONTEXT=""
 FILTER_NS=""
 RESTART_THRESHOLD=5
@@ -32,7 +33,7 @@ OUTPUT_FORMAT="pretty"
 # We capture it here only for display purposes in the header.
 KUBECONFIG_DISPLAY="${KUBECONFIG:-~/.kube/config}"
 
-# ── Colours ───────────────────────────────────────────────────────────────────
+# ── Colours ─────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
   RED="\033[0;31m"
   GREEN="\033[0;32m"
@@ -49,7 +50,7 @@ OK="${GREEN}✔${RESET}"
 WARN="${YELLOW}⚠${RESET}"
 FAIL="${RED}✖${RESET}"
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────────
 usage() {
   local B C Y G R RESET
   if [[ -t 1 ]]; then
@@ -68,6 +69,7 @@ ${B}DESCRIPTION${RESET}
     For every namespace that has at least one active Helm release, checks:
 
       ${G}✔${RESET}  Helm release status
+      ${G}✔${RESET}  Helm history analysis    (rollback detection, failed upgrades)
       ${G}✔${RESET}  Deployment availability  (desired vs ready replicas)
       ${G}✔${RESET}  StatefulSet availability (desired vs ready replicas, revision match)
       ${G}✔${RESET}  Pod health               (phase, readiness, restart count)
@@ -164,14 +166,23 @@ kube() {
   fi
 }
 
-# ── JSON aggregator ───────────────────────────────────────────────────────────
+# Run helm with an optional --kube-context flag.
+helm_cmd() {
+  if [[ -n "$CONTEXT" ]]; then
+    helm --kube-context="$CONTEXT" "$@" 2>/dev/null
+  else
+    helm "$@" 2>/dev/null
+  fi
+}
+
+# ── JSON aggregator ─────────────────────────────────────────────────────
 JSON_OUTPUT="[]"
 
 json_append() {
   JSON_OUTPUT=$(echo "$JSON_OUTPUT" | jq --argjson obj "$1" '. += [$obj]')
 }
 
-# ── Argument parsing ──────────────────────────────────────────────────────────
+# ── Argument parsing ────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -c|--context)   CONTEXT="$2";           shift 2 ;;
@@ -183,8 +194,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ── Validate dependencies ─────────────────────────────────────────────────────
-for dep in kubectl jq; do
+# ── Validate dependencies ──────────────────────────────────────────────
+for dep in kubectl jq helm; do
   if ! command -v "$dep" &>/dev/null; then
     echo "Error: '$dep' is required but not found in PATH." >&2
     exit 1
@@ -197,7 +208,7 @@ if [[ -z "$CONTEXT" ]]; then
   CONTEXT=$(kubectl config current-context 2>/dev/null || echo "unknown")
 fi
 
-# ── Resolve namespaces ────────────────────────────────────────────────────────
+# ── Resolve namespaces ─────────────────────────────────────────────────
 if [[ -n "$FILTER_NS" ]]; then
   NAMESPACES=("$FILTER_NS")
 else
@@ -210,11 +221,11 @@ if [[ ${#NAMESPACES[@]} -eq 0 ]]; then
   exit 1
 fi
 
-# ── Per-namespace check ───────────────────────────────────────────────────────
+# ── Per-namespace check ────────────────────────────────────────────────
 check_namespace() {
   local ns="$1"
 
-  # ── Find deployed Helm releases ───────────────────────────────────────────
+  # ── Find deployed Helm releases ──────────────────────────────────────
   local releases_raw
   releases_raw=$(kube get secret -n "$ns" \
     -l "owner=helm,status=deployed" \
@@ -229,7 +240,7 @@ check_namespace() {
     return
   fi
 
-  # ── Collect namespace-wide data once (reduces API calls) ─────────────────
+  # ── Collect namespace-wide data once (reduces API calls) ─────────────
   local deployments statefulsets pods externalsecrets ingresses cronjobs jobs services events
 
   deployments=$(  kube get deployment    -n "$ns" -o json 2>/dev/null || echo '{"items":[]}')
@@ -244,7 +255,7 @@ check_namespace() {
     --field-selector type=Warning \
     -o json 2>/dev/null || echo '{"items":[]}')
 
-  # ── Pretty output header ──────────────────────────────────────────────────
+  # ── Pretty output header ─────────────────────────────────────────────
   if [[ "$OUTPUT_FORMAT" == "pretty" ]]; then
     log_header "Namespace: ${ns}  (context: ${CONTEXT})"
   fi
@@ -262,7 +273,7 @@ check_namespace() {
       log_section "Release: ${BOLD}${release}${RESET}"
     fi
 
-    # ── 1. Helm release status ──────────────────────────────────────────────
+    # ── 1. Helm release status ─────────────────────────────────────────
     local helm_status helm_version helm_updated
     helm_status=$(kube get secret -n "$ns" \
       -l "owner=helm,status=deployed,name=${release}" \
@@ -288,7 +299,82 @@ check_namespace() {
       --arg updated "$helm_updated" \
       '.checks.helm = {status: $status, revision: $version, lastDeployed: $updated, ok: ($status == "deployed")}')
 
-    # ── 2. Deployments ─────────────────────────────────────────────────────
+    # ── 1b. Helm history — rollback / failed upgrade detection ─────────
+    if [[ "$OUTPUT_FORMAT" == "pretty" ]]; then
+      echo -e "\n    ${BOLD}Helm History:${RESET}"
+    fi
+
+    local history_json history_ok=true history_is_rollback=false
+    local history_rollback_desc="" history_failed_count=0 history_current_rev=0
+
+    history_json=$(helm_cmd history "$release" -n "$ns" --max 20 -o json || echo "")
+
+    if [[ -z "$history_json" || "$history_json" == "null" ]]; then
+      # helm history not available
+      history_ok=true  # don't penalise if we can't retrieve history
+      if [[ "$OUTPUT_FORMAT" == "pretty" ]]; then
+        log_warn "Could not retrieve helm history for '${release}'"
+      fi
+      ns_result=$(echo "$ns_result" | jq \
+        '.checks.helmHistory = {currentRevision: 0, isRollback: false, rollbackDescription: "", recentFailedCount: 0, ok: null, warning: "could not retrieve helm history"}')
+    else
+      # Find the last deployed revision
+      local deployed_entry
+      deployed_entry=$(echo "$history_json" | jq '
+        [.[] | select(.status == "deployed")] | last // empty')
+
+      if [[ -z "$deployed_entry" || "$deployed_entry" == "null" ]]; then
+        # No deployed revision found in history
+        if [[ "$OUTPUT_FORMAT" == "pretty" ]]; then
+          log_warn "No deployed revision found in recent history for '${release}'"
+        fi
+        ns_result=$(echo "$ns_result" | jq \
+          '.checks.helmHistory = {currentRevision: 0, isRollback: false, rollbackDescription: "", recentFailedCount: 0, ok: null, warning: "no deployed revision in history"}')
+      else
+        history_current_rev=$(echo "$deployed_entry" | jq -r '.revision')
+        local deployed_desc
+        deployed_desc=$(echo "$deployed_entry" | jq -r '.description')
+
+        # Check if it's a rollback
+        if [[ "$deployed_desc" == Rollback\ to* ]]; then
+          history_is_rollback=true
+          history_rollback_desc="$deployed_desc"
+          history_ok=false
+        fi
+
+        # Count failed revisions in the recent history
+        history_failed_count=$(echo "$history_json" | jq \
+          '[.[] | select(.status == "failed")] | length')
+
+        if [[ "$history_failed_count" -gt 0 ]]; then
+          history_ok=false
+        fi
+
+        # Pretty output
+        if [[ "$OUTPUT_FORMAT" == "pretty" ]]; then
+          if [[ "$history_is_rollback" == "true" ]]; then
+            log_warn "Last deploy (rev ${history_current_rev}) is a ROLLBACK (${history_rollback_desc})"
+          else
+            log_ok  "Last deploy (rev ${history_current_rev}) is a clean upgrade"
+          fi
+
+          if [[ "$history_failed_count" -gt 0 ]]; then
+            log_warn "${history_failed_count} failed revision(s) in recent history"
+          fi
+        fi
+
+        # JSON output
+        ns_result=$(echo "$ns_result" | jq \
+          --argjson rev  "$history_current_rev" \
+          --argjson rb   "$($history_is_rollback && echo true || echo false)" \
+          --arg     desc "$history_rollback_desc" \
+          --argjson fc   "$history_failed_count" \
+          --argjson ok   "$($history_ok && echo true || echo false)" \
+          '.checks.helmHistory = {currentRevision: $rev, isRollback: $rb, rollbackDescription: $desc, recentFailedCount: $fc, ok: $ok}')
+      fi
+    fi
+
+    # ── 2. Deployments ─────────────────────────────────────────────────
     if [[ "$OUTPUT_FORMAT" == "pretty" ]]; then
       echo -e "\n    ${BOLD}Deployments:${RESET}"
     fi
@@ -356,7 +442,7 @@ check_namespace() {
 
     ns_result=$(echo "$ns_result" | jq --argjson dl "$deploy_check_list" '.checks.deployments = $dl')
 
-    # ── 3. StatefulSets ────────────────────────────────────────────────────
+    # ── 3. StatefulSets ────────────────────────────────────────────────
     if [[ "$OUTPUT_FORMAT" == "pretty" ]]; then
       echo -e "\n    ${BOLD}StatefulSets:${RESET}"
     fi
@@ -429,7 +515,7 @@ check_namespace() {
 
     ns_result=$(echo "$ns_result" | jq --argjson sl "$sts_check_list" '.checks.statefulSets = $sl')
 
-    # ── 4. Pods ────────────────────────────────────────────────────────────
+    # ── 4. Pods ────────────────────────────────────────────────────────
     if [[ "$OUTPUT_FORMAT" == "pretty" ]]; then
       echo -e "\n    ${BOLD}Pods:${RESET}"
     fi
@@ -492,7 +578,7 @@ check_namespace() {
 
     ns_result=$(echo "$ns_result" | jq --argjson pl "$pod_check_list" '.checks.pods = $pl')
 
-    # ── 5. ExternalSecrets ─────────────────────────────────────────────────
+    # ── 5. ExternalSecrets ─────────────────────────────────────────────
     if [[ "$OUTPUT_FORMAT" == "pretty" ]]; then
       echo -e "\n    ${BOLD}ExternalSecrets:${RESET}"
     fi
@@ -542,7 +628,7 @@ check_namespace() {
 
     ns_result=$(echo "$ns_result" | jq --argjson esl "$es_check_list" '.checks.externalSecrets = $esl')
 
-    # ── 6. Kubernetes Secrets referenced by ExternalSecrets ────────────────
+    # ── 6. Kubernetes Secrets referenced by ExternalSecrets ────────────
     if [[ "$OUTPUT_FORMAT" == "pretty" ]]; then
       echo -e "\n    ${BOLD}Secrets (referenced by ExternalSecrets):${RESET}"
     fi
@@ -585,7 +671,7 @@ check_namespace() {
 
     ns_result=$(echo "$ns_result" | jq --argjson sl "$secret_check_list" '.checks.secrets = $sl')
 
-    # ── 7. Ingresses ───────────────────────────────────────────────────────
+    # ── 7. Ingresses ───────────────────────────────────────────────────
     if [[ "$OUTPUT_FORMAT" == "pretty" ]]; then
       echo -e "\n    ${BOLD}Ingresses:${RESET}"
     fi
@@ -683,7 +769,7 @@ check_namespace() {
 
     ns_result=$(echo "$ns_result" | jq --argjson il "$ing_check_list" '.checks.ingresses = $il')
 
-    # ── 8. CronJobs ────────────────────────────────────────────────────────
+    # ── 8. CronJobs ────────────────────────────────────────────────────
     if [[ "$OUTPUT_FORMAT" == "pretty" ]]; then
       echo -e "\n    ${BOLD}CronJobs:${RESET}"
     fi
@@ -807,7 +893,7 @@ check_namespace() {
 
     ns_result=$(echo "$ns_result" | jq --argjson cl "$cj_check_list" '.checks.cronJobs = $cl')
 
-    # ── 9. Warning events ──────────────────────────────────────────────────
+    # ── 9. Warning events ──────────────────────────────────────────────
     if [[ "$OUTPUT_FORMAT" == "pretty" ]]; then
       echo -e "\n    ${BOLD}Warning Events:${RESET}"
     fi
@@ -860,10 +946,11 @@ check_namespace() {
       --argjson wc "$warn_count" \
       '.checks.warningEvents = {count: $wc, events: $wl}')
 
-    # ── 10. Overall release health ─────────────────────────────────────────
+    # ── 10. Overall release health ─────────────────────────────────────
     local overall_ok
     overall_ok=$(echo "$ns_result" | jq '
       .checks.helm.ok == true and
+      (if .checks.helmHistory.ok != null then .checks.helmHistory.ok == true else true end) and
       ([.checks.deployments[]  | select(.ok != null) | .ok] | all) and
       ([.checks.statefulSets[] | select(.ok != null) | .ok] | all) and
       ([.checks.pods[]         | select(.ok != null) | .ok] | all) and
@@ -889,7 +976,7 @@ check_namespace() {
   done # releases
 }
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────
 main() {
   if [[ "$OUTPUT_FORMAT" == "pretty" ]]; then
     echo -e "${BOLD}${CYAN}"
